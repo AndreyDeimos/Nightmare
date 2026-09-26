@@ -10,7 +10,6 @@ find_package(Threads REQUIRED)
 
 add_executable(Nightmare
 	src/main.cpp	
-	src/tcp-proxy.cpp
 )
 
 target_link_libraries(Nightmare
