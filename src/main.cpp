@@ -15,7 +15,6 @@
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/system/system_error.hpp>
-#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <print>
@@ -38,6 +37,7 @@ struct Transport {
   async_write_some(boost::asio::const_buffer buf) = 0;
   virtual boost::asio::awaitable<size_t>
   async_read_some(boost::asio::mutable_buffer buf) = 0;
+  virtual boost::asio::awaitable<void> shutdown_send() = 0;
 
   boost::asio::awaitable<void> read_exact(boost::asio::mutable_buffer buf) {
     int got = 0;
@@ -69,6 +69,10 @@ struct TransportRaw : Transport {
   async_read_some(boost::asio::mutable_buffer buf) {
     co_return co_await socket.async_read_some(buf, boost::asio::use_awaitable);
   }
+  boost::asio::awaitable<void> shutdown_send() {
+    socket.shutdown(tcp::socket::shutdown_send);
+    co_return;
+  }
   TransportRaw(tcp::socket &socket_) : socket(std::move(socket_)) {};
 };
 
@@ -97,12 +101,18 @@ boost::asio::awaitable<tcp::socket> dial(dest &target) {
 
 boost::asio::awaitable<void> pump(Transport &from, Transport &to) {
   std::array<std::byte, 4096> buf;
-  for (;;) {
-    int n = co_await from.async_read_some(boost::asio::buffer(buf));
-    if (n == 0)
-      throw boost::system::system_error(boost::asio::error::eof);
-    co_await to.write_exact(boost::asio::buffer(buf, n));
+  try {
+    for (;;) {
+      int n = co_await from.async_read_some(boost::asio::buffer(buf));
+      if (n == 0)
+        break;
+      co_await to.write_exact(boost::asio::buffer(buf, n));
+    }
+  } catch (boost::system::system_error &e) {
+    if (e.code() != boost::asio::error::eof)
+      throw;
   }
+  co_await to.shutdown_send();
 }
 
 boost::asio::awaitable<void> relay(Transport &client, Transport &upstream) {
