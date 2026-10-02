@@ -12,16 +12,23 @@
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/ip/address_v4.hpp>
 #include <boost/asio/ip/address_v6.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/asio/ssl/context.hpp>
+#include <boost/asio/ssl/error.hpp>
+#include <boost/asio/ssl/stream.hpp>
+#include <boost/asio/ssl/stream_base.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/system/system_error.hpp>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <print>
 #include <string>
 #include <variant>
 
-using boost::asio::ip::tcp;
+using tcp = boost::asio::ip::tcp;
+namespace ssl = boost::asio::ssl;
 using namespace boost::asio::experimental::awaitable_operators;
 
 // https://www.boost.org/doc/libs/latest/doc/html/boost_asio/example/cpp20/coroutines/echo_server_with_as_tuple_default.cpp
@@ -73,7 +80,53 @@ struct TransportRaw : Transport {
     socket.shutdown(tcp::socket::shutdown_send);
     co_return;
   }
-  TransportRaw(tcp::socket &socket_) : socket(std::move(socket_)) {};
+  explicit TransportRaw(tcp::socket &&socket_) : socket(std::move(socket_)) {};
+  static boost::asio::awaitable<std::unique_ptr<TransportRaw>>
+  create(tcp::socket socket_) {
+    auto t = std::make_unique<TransportRaw>(std::move(socket_));
+    co_return t;
+  }
+};
+
+struct TransportTLS : Transport {
+  ssl::context ctx;
+  ssl::stream<tcp::socket> socket;
+
+  TransportTLS(tcp::socket &&socket_)
+      : ctx(make_ctx()), socket(std::move(socket_), ctx) {}
+
+  static ssl::context make_ctx() {
+    ssl::context ctx{ssl::context::tls_server};
+    ctx.use_certificate_chain_file("server.pem");
+    ctx.use_private_key_file("server.pem", ssl::context::pem);
+    return ctx;
+  }
+
+  boost::asio::awaitable<void> handshake() {
+    co_await socket.async_handshake(ssl::stream_base::server,
+                                    boost::asio::use_awaitable);
+  }
+
+  boost::asio::awaitable<void> shutdown_send() {
+    co_await socket.async_shutdown(boost::asio::use_awaitable);
+  }
+
+  boost::asio::awaitable<size_t>
+  async_read_some(boost::asio::mutable_buffer buf) {
+    co_return co_await socket.async_read_some(buf, boost::asio::use_awaitable);
+  }
+
+  boost::asio::awaitable<size_t>
+  async_write_some(boost::asio::const_buffer buf) {
+    co_return co_await socket.async_write_some(buf, boost::asio::use_awaitable);
+  }
+
+  static boost::asio::awaitable<std::unique_ptr<TransportTLS>>
+  create(tcp::socket socket_) {
+    auto t = std::make_unique<TransportTLS>(std::move(socket_));
+    co_await t->handshake();
+    co_return t;
+  }
 };
 
 boost::asio::awaitable<tcp::socket> dial(dest &target) {
@@ -103,20 +156,22 @@ boost::asio::awaitable<void> pump(Transport &from, Transport &to) {
   std::array<std::byte, 4096> buf;
   try {
     for (;;) {
-      int n = co_await from.async_read_some(boost::asio::buffer(buf));
+      size_t n = co_await from.async_read_some(boost::asio::buffer(buf));
       if (n == 0)
         break;
       co_await to.write_exact(boost::asio::buffer(buf, n));
     }
   } catch (boost::system::system_error &e) {
-    if (e.code() != boost::asio::error::eof)
+    if (e.code() != boost::asio::error::eof &&
+        e.code() != ssl::error::stream_truncated)
       throw;
   }
   co_await to.shutdown_send();
 }
 
-boost::asio::awaitable<void> relay(Transport &client, Transport &upstream) {
-  co_await (pump(client, upstream) && pump(upstream, client));
+boost::asio::awaitable<void> relay(std::unique_ptr<Transport> client,
+                                   std::unique_ptr<Transport> upstream) {
+  co_await (pump(*client, *upstream) && pump(*upstream, *client));
 }
 
 namespace vless {
@@ -182,8 +237,8 @@ boost::asio::awaitable<ProtoInit> handshake(Transport &transport) {
 }
 
 boost::asio::awaitable<void> listener(tcp::socket socket) {
-  TransportRaw transport(socket);
-  ProtoInit protoinit = co_await handshake(transport);
+  auto t = co_await TransportTLS::create(std::move(socket));
+  ProtoInit protoinit = co_await handshake(*t);
   // TODO: auth
   if (protoinit.command != Command::TCP) {
     throw boost::system::system_error(
@@ -191,9 +246,9 @@ boost::asio::awaitable<void> listener(tcp::socket socket) {
   }
 
   tcp::socket upstream = co_await dial(protoinit.target);
-  TransportRaw upstream_transport(upstream);
+  auto upstream_transport = co_await TransportRaw::create(std::move(upstream));
 
-  co_await relay(transport, upstream_transport);
+  co_await relay(std::move(t), std::move(upstream_transport));
 }
 } // namespace vless
 
