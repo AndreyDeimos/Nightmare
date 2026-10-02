@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Boost CONFIG REQUIRED)
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 add_executable(Nightmare
 	src/main.cpp	
@@ -16,4 +17,5 @@ target_link_libraries(Nightmare
 	PRIVATE
 		Boost::boost
 		Threads::Threads
+		OpenSSL::SSL
 )
