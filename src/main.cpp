@@ -22,9 +22,12 @@
 #include <boost/system/system_error.hpp>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <print>
 #include <string>
+#include <utility>
 #include <variant>
 
 using tcp = boost::asio::ip::tcp;
@@ -89,18 +92,11 @@ struct TransportRaw : Transport {
 };
 
 struct TransportTLS : Transport {
-  ssl::context ctx;
+  std::shared_ptr<ssl::context> ctx;
   ssl::stream<tcp::socket> socket;
 
-  TransportTLS(tcp::socket &&socket_)
-      : ctx(make_ctx()), socket(std::move(socket_), ctx) {}
-
-  static ssl::context make_ctx() {
-    ssl::context ctx{ssl::context::tls_server};
-    ctx.use_certificate_chain_file("server.pem");
-    ctx.use_private_key_file("server.pem", ssl::context::pem);
-    return ctx;
-  }
+  TransportTLS(tcp::socket &&socket_, std::shared_ptr<ssl::context> ctx_)
+      : ctx(ctx_), socket(std::move(socket_), *ctx) {}
 
   boost::asio::awaitable<void> handshake() {
     co_await socket.async_handshake(ssl::stream_base::server,
@@ -122,8 +118,8 @@ struct TransportTLS : Transport {
   }
 
   static boost::asio::awaitable<std::unique_ptr<TransportTLS>>
-  create(tcp::socket socket_) {
-    auto t = std::make_unique<TransportTLS>(std::move(socket_));
+  create(tcp::socket socket_, std::shared_ptr<ssl::context> ctx) {
+    auto t = std::make_unique<TransportTLS>(std::move(socket_), ctx);
     co_await t->handshake();
     co_return t;
   }
@@ -236,23 +232,84 @@ boost::asio::awaitable<ProtoInit> handshake(Transport &transport) {
   co_return req;
 }
 
-boost::asio::awaitable<void> listener(tcp::socket socket) {
-  auto t = co_await TransportTLS::create(std::move(socket));
-  ProtoInit protoinit = co_await handshake(*t);
-  // TODO: auth
-  if (protoinit.command != Command::TCP) {
-    throw boost::system::system_error(
-        boost::asio::error::operation_not_supported);
-  }
-
-  tcp::socket upstream = co_await dial(protoinit.target);
-  auto upstream_transport = co_await TransportRaw::create(std::move(upstream));
-
-  co_await relay(std::move(t), std::move(upstream_transport));
-}
+// boost::asio::awaitable<void> listener(tcp::socket socket) {
+//   auto t = co_await TransportTLS::create(std::move(socket));
+//   ProtoInit protoinit = co_await handshake(*t);
+//   // TODO: auth
+//   if (protoinit.command != Command::TCP) {
+//     throw boost::system::system_error(
+//         boost::asio::error::operation_not_supported);
+//   }
+//
+//   tcp::socket upstream = co_await dial(protoinit.target);
+//   auto upstream_transport = co_await
+//   TransportRaw::create(std::move(upstream));
+//
+//   co_await relay(std::move(t), std::move(upstream_transport));
+// }
 } // namespace vless
 
-boost::asio::awaitable<void> listener(tcp::acceptor &acceptor) {
+struct Config {
+  bool tls;
+  bool vless;
+  std::string certificate_chain_file = "server.pem";
+  std::string private_key_file = "server.pem";
+};
+
+struct HandshakeResult {
+  dest target;
+  std::optional<vless::ProtoInit> proxy;
+};
+
+struct Session {
+  std::unique_ptr<Transport> transport;
+  HandshakeResult handshake;
+};
+
+std::function<boost::asio::awaitable<Session>(tcp::socket)>
+make_inbound_factory(Config &cfg) {
+  if (cfg.tls) {
+    auto ctx = std::make_shared<ssl::context>(ssl::context::tls_server);
+    ctx->use_certificate_chain_file("server.pem");
+    ctx->use_private_key_file("server.pem", ssl::context::pem);
+    return [&cfg, ctx](tcp::socket socket_) -> boost::asio::awaitable<Session> {
+      auto t = co_await TransportTLS::create(std::move(socket_), ctx);
+      if (cfg.vless) {
+        vless::ProtoInit proxy = co_await vless::handshake(*t);
+        HandshakeResult handshake = {proxy.target, proxy};
+        co_return Session{std::move(t), handshake};
+      } else {
+        co_return Session{std::move(t), {{"example.com", 443}, std::nullopt}};
+      }
+    };
+  } else {
+    return [&cfg](tcp::socket socket_) -> boost::asio::awaitable<Session> {
+      auto t = co_await TransportRaw::create(std::move(socket_));
+      if (cfg.vless) {
+        vless::ProtoInit proxy = co_await vless::handshake(*t);
+        co_return Session{std::move(t), {proxy.target, proxy}};
+      } else {
+        co_return Session{std::move(t), {{"example.com", 443}, std::nullopt}};
+      }
+    };
+  }
+}
+
+std::function<boost::asio::awaitable<std::unique_ptr<Transport>>(dest &)>
+make_outbound_factory() {
+  // TODO: custom outbounds
+  return
+      [](dest &target) -> boost::asio::awaitable<std::unique_ptr<Transport>> {
+        co_return co_await TransportRaw::create(
+            std::move(co_await dial(target)));
+      };
+}
+
+boost::asio::awaitable<void> listener(
+    tcp::acceptor &acceptor,
+    std::function<boost::asio::awaitable<Session>(tcp::socket)> get_inbound,
+    std::function<boost::asio::awaitable<std::unique_ptr<Transport>>(dest &)>
+        get_outbound) {
   for (;;) {
     auto [e, socket] = co_await acceptor.async_accept(boost::asio::as_tuple);
     if (e) {
@@ -260,9 +317,12 @@ boost::asio::awaitable<void> listener(tcp::acceptor &acceptor) {
       co_return;
     }
     if (socket.is_open()) {
-      boost::asio::co_spawn(co_await boost::asio::this_coro::executor,
-                            vless::listener(std::move(socket)),
-                            boost::asio::detached);
+      auto t = co_await get_inbound(std::move(socket));
+      boost::asio::co_spawn(
+          co_await boost::asio::this_coro::executor,
+          relay(std::move(t.transport),
+                std::move(co_await get_outbound(t.handshake.target))),
+          boost::asio::detached);
     }
   }
 }
@@ -276,7 +336,11 @@ int main() {
     acceptor.open(endpoint.protocol());
     acceptor.bind(endpoint);
     acceptor.listen();
-    co_spawn(ex, listener(acceptor), boost::asio::detached);
+    Config cfg = {1, 1};
+    co_spawn(
+        ex,
+        listener(acceptor, make_inbound_factory(cfg), make_outbound_factory()),
+        boost::asio::detached);
     ctx.run();
   } catch (boost::system::system_error &e) {
     std::println("Error: {0}", e.what());
