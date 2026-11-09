@@ -11,6 +11,8 @@ find_package(OpenSSL REQUIRED)
 
 add_executable(Nightmare
 	src/main.cpp	
+	src/net.cpp
+	src/protocol.cpp
 )
 
 target_link_libraries(Nightmare
